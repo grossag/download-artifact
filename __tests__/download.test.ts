@@ -326,7 +326,41 @@ describe('download', () => {
         2: 'x'
       })
 
-      await expect(run()).rejects.toThrow('unsupported format')
+      await run()
+
+      expect(core.warning).toHaveBeenCalledWith(
+        expect.stringContaining('unsupported format')
+      )
+      // Falls back to the regular layout for the unrestored artifact
+      expect(await fs.readFile(path.join(dest, 'a'), 'utf8')).toBe('x')
+    })
+
+    test('cleans up the staging directory when a digest check fails', async () => {
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'dl-temp-'))
+      const prevTemp = process.env['RUNNER_TEMP']
+      process.env['RUNNER_TEMP'] = temp
+      try {
+        setupRun([manifestArtifact(1, 'g'), {id: 2, name: 'a_b'}], {
+          1: manifest(['a_b', 'a/b']),
+          2: 'x'
+        })
+        const impl = (
+          artifact.default.downloadArtifact as jest.Mock<any>
+        ).getMockImplementation()!
+        jest
+          .spyOn(artifact.default, 'downloadArtifact')
+          .mockImplementation(async (id: number, opts: any) => {
+            const result = await (impl as any)(id, opts)
+            return {...result, digestMismatch: id === 2}
+          })
+
+        await expect(run()).rejects.toThrow('Digest validation failed')
+        expect(await fs.readdir(temp)).toEqual([])
+      } finally {
+        if (prevTemp === undefined) delete process.env['RUNNER_TEMP']
+        else process.env['RUNNER_TEMP'] = prevTemp
+        await fs.rm(temp, {recursive: true, force: true})
+      }
     })
   })
 
