@@ -73,7 +73,11 @@ async function readAllManifests(
   for (const manifestArtifact of allArtifacts.filter(a =>
     isManifestName(a.name)
   )) {
+    core.info(`Reading upload manifest '${manifestArtifact.name}'`)
     const entries = await readManifest(manifestArtifact, options)
+    core.debug(
+      `Manifest '${manifestArtifact.name}' lists ${entries.size} file(s)`
+    )
     entries.forEach((p, name) => restorePaths.set(name, p))
   }
   return restorePaths
@@ -256,9 +260,14 @@ export async function run(): Promise<void> {
           (original !== undefined && matcher.match(original))
         )
       })
-      core.debug(
-        `Filtered from ${listArtifactResponse.artifacts.length} to ${artifacts.length} artifacts`
+      core.info(
+        `Pattern '${inputs.pattern}' matched ${artifacts.length} of ${listArtifactResponse.artifacts.length} artifacts`
       )
+      if (artifacts.length === 0) {
+        core.warning(
+          `Pattern '${inputs.pattern}' matched no artifact names or uploaded file paths. Available paths: ${[...manifestPaths.values()].slice(0, 20).join(', ') || '(none)'}`
+        )
+      }
     } else {
       core.info(
         'No input name, artifact-ids or pattern filtered specified, downloading all artifacts'
@@ -380,6 +389,7 @@ export async function run(): Promise<void> {
           )
         }
         await fs.mkdir(path.dirname(dest), {recursive: true})
+        core.info(`Restoring '${artifact.name}' to '${dest}'`)
         await fs.copyFile(path.join(source, files[0]), dest)
       }
     } finally {

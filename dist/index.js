@@ -129527,7 +129527,9 @@ async function readManifest(manifestArtifact, options) {
 async function readAllManifests(allArtifacts, options) {
     const restorePaths = new Map();
     for (const manifestArtifact of allArtifacts.filter(a => isManifestName(a.name))) {
+        info(`Reading upload manifest '${manifestArtifact.name}'`);
         const entries = await readManifest(manifestArtifact, options);
+        core_debug(`Manifest '${manifestArtifact.name}' lists ${entries.size} file(s)`);
         entries.forEach((p, name) => restorePaths.set(name, p));
     }
     return restorePaths;
@@ -129661,7 +129663,10 @@ async function run() {
                 return (matcher.match(artifact.name) ||
                     (original !== undefined && matcher.match(original)));
             });
-            core_debug(`Filtered from ${listArtifactResponse.artifacts.length} to ${artifacts.length} artifacts`);
+            info(`Pattern '${inputs.pattern}' matched ${artifacts.length} of ${listArtifactResponse.artifacts.length} artifacts`);
+            if (artifacts.length === 0) {
+                warning(`Pattern '${inputs.pattern}' matched no artifact names or uploaded file paths. Available paths: ${[...manifestPaths.values()].slice(0, 20).join(', ') || '(none)'}`);
+            }
         }
         else {
             info('No input name, artifact-ids or pattern filtered specified, downloading all artifacts');
@@ -129756,6 +129761,7 @@ async function run() {
                     throw new Error(`Expected one file in artifact '${artifact.name}' but found ${files.length}`);
                 }
                 await promises_namespaceObject.mkdir(external_path_.dirname(dest), { recursive: true });
+                info(`Restoring '${artifact.name}' to '${dest}'`);
                 await promises_namespaceObject.copyFile(external_path_.join(source, files[0]), dest);
             }
         }
