@@ -1,4 +1,13 @@
-import {jest, describe, test, expect, beforeEach} from '@jest/globals'
+import {
+  jest,
+  describe,
+  test,
+  expect,
+  beforeEach,
+  afterEach
+} from '@jest/globals'
+import * as fs from 'fs/promises'
+import * as os from 'os'
 import * as path from 'path'
 
 // Mock @actions/github before importing modules that use it
@@ -152,6 +161,173 @@ describe('download', () => {
 
     expect(core.info).toHaveBeenCalledWith('Total of 2 artifact(s) downloaded')
     expect(artifact.default.downloadArtifact).toHaveBeenCalledTimes(2)
+  })
+
+  describe('upload manifest', () => {
+    let dest: string
+    let downloadedIds: number[]
+
+    // Fakes a run containing the given artifacts; contents[id] is written as the downloaded file
+    const setupRun = (
+      artifacts: {id: number; name: string}[],
+      contents: Record<number, string>
+    ) => {
+      downloadedIds = []
+      jest.spyOn(artifact.default, 'listArtifacts').mockResolvedValue({
+        artifacts: artifacts.map(a => ({...a, size: 1, digest: `d${a.id}`}))
+      } as any)
+      jest
+        .spyOn(artifact.default, 'downloadArtifact')
+        .mockImplementation(async (id: number, opts: any) => {
+          downloadedIds.push(id)
+          const name = artifacts.find(a => a.id === id)!.name
+          await fs.mkdir(opts.path, {recursive: true})
+          await fs.writeFile(path.join(opts.path, name), contents[id])
+          return {digestMismatch: false}
+        })
+    }
+    const manifest = (...files: [string, string][]) =>
+      JSON.stringify({
+        version: 1,
+        files: files.map(([artifact, p]) => ({artifact, path: p}))
+      })
+    const manifestArtifact = (id: number, group: string) => ({
+      id,
+      name: `.artifact_upload_manifest.${group}.json`
+    })
+
+    beforeEach(async () => {
+      dest = await fs.mkdtemp(path.join(os.tmpdir(), 'dl-test-'))
+      mockInputs({
+        [Inputs.Name]: '',
+        [Inputs.Pattern]: '',
+        [Inputs.Path]: dest
+      })
+    })
+
+    afterEach(async () => {
+      await fs.rm(dest, {recursive: true, force: true})
+    })
+
+    test('restores original paths and skips the manifest itself', async () => {
+      setupRun(
+        [
+          manifestArtifact(1, 'g'),
+          {id: 2, name: 'tests_folder1_a.txt'},
+          {id: 3, name: 'tests_b.txt'}
+        ],
+        {
+          1: manifest(
+            ['tests_folder1_a.txt', 'tests/folder1/a.txt'],
+            ['tests_b.txt', 'tests/b.txt']
+          ),
+          2: 'A',
+          3: 'B'
+        }
+      )
+
+      await run()
+
+      expect(
+        await fs.readFile(path.join(dest, 'tests', 'folder1', 'a.txt'), 'utf8')
+      ).toBe('A')
+      expect(await fs.readFile(path.join(dest, 'tests', 'b.txt'), 'utf8')).toBe(
+        'B'
+      )
+      expect((await fs.readdir(dest)).sort()).toEqual(['tests'])
+      expect(core.info).toHaveBeenCalledWith(
+        'Total of 2 artifact(s) downloaded'
+      )
+    })
+
+    test('combines manifests from several upload groups', async () => {
+      setupRun(
+        [
+          manifestArtifact(1, 'one'),
+          manifestArtifact(2, 'two'),
+          {id: 3, name: 'x_a.txt'},
+          {id: 4, name: 'y_b.txt'}
+        ],
+        {
+          1: manifest(['x_a.txt', 'x/a.txt']),
+          2: manifest(['y_b.txt', 'y/b.txt']),
+          3: 'A',
+          4: 'B'
+        }
+      )
+
+      await run()
+
+      expect((await fs.readdir(dest)).sort()).toEqual(['x', 'y'])
+    })
+
+    test.each([
+      ['tests/folder1/a.txt', [3]],
+      ['tests/folder1/*.txt', [3]],
+      ['tests/**', [3, 4]],
+      ['tests_b.txt', [4]]
+    ])('pattern %s matches by path or artifact name', async (pattern, ids) => {
+      setupRun(
+        [
+          manifestArtifact(1, 'g'),
+          {id: 3, name: 'tests_folder1_a.txt'},
+          {id: 4, name: 'tests_b.txt'},
+          {id: 5, name: 'other'}
+        ],
+        {
+          1: manifest(
+            ['tests_folder1_a.txt', 'tests/folder1/a.txt'],
+            ['tests_b.txt', 'tests/b.txt']
+          ),
+          3: 'A',
+          4: 'B',
+          5: 'O'
+        }
+      )
+      mockInputs({
+        [Inputs.Name]: '',
+        [Inputs.Pattern]: pattern,
+        [Inputs.Path]: dest
+      })
+
+      await run()
+
+      expect(downloadedIds.filter(id => id !== 1).sort()).toEqual(ids)
+    })
+
+    test('does not restore paths when downloading by name', async () => {
+      setupRun([{id: 3, name: 'tests_b.txt'}], {3: 'B'})
+      jest.spyOn(artifact.default, 'getArtifact').mockResolvedValue({
+        artifact: {id: 3, name: 'tests_b.txt', size: 1, digest: 'd3'}
+      } as any)
+      mockInputs({[Inputs.Name]: 'tests_b.txt', [Inputs.Path]: dest})
+
+      await run()
+
+      expect(await fs.readdir(dest)).toEqual(['tests_b.txt'])
+    })
+
+    test('rejects manifest paths that escape the download path', async () => {
+      setupRun([manifestArtifact(1, 'g'), {id: 2, name: 'evil'}], {
+        1: manifest(['evil', '../evil.txt']),
+        2: 'x'
+      })
+
+      await expect(run()).rejects.toThrow('escapes the download path')
+      expect(downloadedIds).toEqual([1])
+      await expect(
+        fs.access(path.join(dest, '..', 'evil.txt'))
+      ).rejects.toBeDefined()
+    })
+
+    test('rejects an unsupported manifest version', async () => {
+      setupRun([manifestArtifact(1, 'g'), {id: 2, name: 'a'}], {
+        1: JSON.stringify({version: 2, files: []}),
+        2: 'x'
+      })
+
+      await expect(run()).rejects.toThrow('unsupported format')
+    })
   })
 
   test('sets download path output even when no artifacts are found', async () => {

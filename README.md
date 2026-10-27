@@ -15,6 +15,7 @@ See also [upload-artifact](https://github.com/actions/upload-artifact).
   - [Download Artifacts by ID](#download-artifacts-by-id)
   - [Download All Artifacts](#download-all-artifacts)
   - [Download multiple (filtered) Artifacts to the same directory](#download-multiple-filtered-artifacts-to-the-same-directory)
+  - [Download Files Uploaded Individually from a Folder](#download-files-uploaded-individually-from-a-folder)
   - [Download Artifacts from other Workflow Runs or Repositories](#download-artifacts-from-other-workflow-runs-or-repositories)
   - [Maintaining File Permissions](#maintaining-file-permissions)
 
@@ -66,6 +67,7 @@ You are welcome to still raise bugs in this repo.
     path:
 
     # A glob pattern to the artifacts that should be downloaded.
+    # For files uploaded individually by upload-artifact (archive: false), the pattern may also match the original relative path, e.g. 'tests/**'.
     # Ignored if name is specified.
     # Optional.
     pattern:
@@ -283,6 +285,19 @@ my-artifact/
   file-ubuntu-latest.txt
   file-windows-latest.txt
 ```
+
+### Download Files Uploaded Individually from a Folder
+
+When [upload-artifact](https://github.com/actions/upload-artifact) uploads multiple files with `archive: false`, each file becomes its own artifact named by joining its path with `_` (e.g. `tests/folder1/a.txt` becomes `tests_folder1_a.txt`) and a `.artifact_upload_manifest.<name>.json` artifact records the original paths. When this action downloads from a run containing such a manifest (no `name` input), the files are restored to their original relative paths under `path`, regardless of `merge-multiple`, and the manifest itself is not written. `pattern` can match either the artifact name or the original path:
+
+```yaml
+- uses: actions/download-artifact@v8
+  with:
+    path: out
+    pattern: tests/folder1/*.txt # restores out/tests/folder1/a.txt, ...
+```
+
+Downloading by `name` does not use the manifest, so the file is written directly to `path`.
 
 ### Download Artifacts from other Workflow Runs or Repositories
 

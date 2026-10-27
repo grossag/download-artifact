@@ -77644,6 +77644,8 @@ __nccwpck_require__.d(mappers_namespaceObject, {
   UserDelegationKey: () => (UserDelegationKey)
 });
 
+;// CONCATENATED MODULE: external "fs/promises"
+const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("fs/promises");
 // EXTERNAL MODULE: external "os"
 var external_os_ = __nccwpck_require__(857);
 // EXTERNAL MODULE: external "path"
@@ -121965,8 +121967,6 @@ function uploadToBlobStorage(authenticatedUploadURL, uploadStream, contentType) 
     });
 }
 //# sourceMappingURL=blob-upload.js.map
-;// CONCATENATED MODULE: external "fs/promises"
-const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("fs/promises");
 // EXTERNAL MODULE: ./node_modules/archiver/index.js
 var archiver = __nccwpck_require__(9392);
 ;// CONCATENATED MODULE: ./node_modules/@actions/artifact/lib/internal/upload/stream.js
@@ -129482,7 +129482,65 @@ var Outputs;
 
 
 
+
 const PARALLEL_DOWNLOADS = 5;
+const MANIFEST_PREFIX = '.artifact_upload_manifest.';
+const MANIFEST_SUFFIX = '.json';
+const isManifestName = (name) => name.startsWith(MANIFEST_PREFIX) &&
+    name.endsWith(MANIFEST_SUFFIX) &&
+    name.length > MANIFEST_PREFIX.length + MANIFEST_SUFFIX.length;
+// Maps artifact name -> original relative path, as written by upload-artifact
+async function readManifest(manifestArtifact, options) {
+    const dir = await promises_namespaceObject.mkdtemp(external_path_.join(process.env['RUNNER_TEMP'] || external_os_.tmpdir(), 'download-manifest-'));
+    try {
+        await lib_artifact.downloadArtifact(manifestArtifact.id, {
+            ...options,
+            path: dir,
+            expectedHash: manifestArtifact.digest
+        });
+        let manifest;
+        try {
+            manifest = JSON.parse(await promises_namespaceObject.readFile(external_path_.join(dir, manifestArtifact.name), 'utf8'));
+        }
+        catch (error) {
+            throw new Error(`Unable to read manifest '${manifestArtifact.name}': ${error.message}`);
+        }
+        if (manifest?.version !== 1 || !Array.isArray(manifest.files)) {
+            throw new Error(`Manifest '${manifestArtifact.name}' has an unsupported format`);
+        }
+        const map = new Map();
+        for (const entry of manifest.files) {
+            if (typeof entry?.artifact !== 'string' ||
+                typeof entry?.path !== 'string' ||
+                !entry.path) {
+                throw new Error(`Manifest '${manifestArtifact.name}' contains an invalid entry`);
+            }
+            map.set(entry.artifact, entry.path);
+        }
+        return map;
+    }
+    finally {
+        await promises_namespaceObject.rm(dir, { recursive: true, force: true });
+    }
+}
+// Combines the manifests of every upload-artifact group found in the run
+async function readAllManifests(allArtifacts, options) {
+    const restorePaths = new Map();
+    for (const manifestArtifact of allArtifacts.filter(a => isManifestName(a.name))) {
+        const entries = await readManifest(manifestArtifact, options);
+        entries.forEach((p, name) => restorePaths.set(name, p));
+    }
+    return restorePaths;
+}
+// Resolves a manifest path, refusing anything that would escape the destination
+function resolveRestorePath(root, relative) {
+    const dest = external_path_.resolve(root, ...relative.split('/'));
+    const fromRoot = external_path_.relative(root, dest);
+    if (!fromRoot || fromRoot.startsWith('..') || external_path_.isAbsolute(fromRoot)) {
+        throw new Error(`Manifest path '${relative}' escapes the download path`);
+    }
+    return dest;
+}
 const chunk = (arr, n) => arr.reduce((acc, cur, i) => {
     const index = Math.floor(i / n);
     acc[index] = [...(acc[index] || []), cur];
@@ -129540,6 +129598,7 @@ async function run() {
     }
     let artifacts = [];
     let artifactIds = [];
+    let manifestPaths = new Map();
     if (isSingleArtifactDownload) {
         info(`Downloading single artifact`);
         const { artifact: targetArtifact } = await lib_artifact.getArtifact(inputs.name, options);
@@ -129572,6 +129631,7 @@ async function run() {
             latest: true,
             ...options
         });
+        manifestPaths = await readAllManifests(listArtifactResponse.artifacts, options);
         artifacts = listArtifactResponse.artifacts.filter(artifact => artifactIds.includes(artifact.id));
         if (artifacts.length === 0) {
             throw new Error(`None of the provided artifact IDs were found`);
@@ -129588,12 +129648,19 @@ async function run() {
             latest: true,
             ...options
         });
+        manifestPaths = await readAllManifests(listArtifactResponse.artifacts, options);
         artifacts = listArtifactResponse.artifacts;
         core_debug(`Found ${artifacts.length} artifacts in run`);
         if (inputs.pattern) {
             info(`Filtering artifacts by pattern '${inputs.pattern}'`);
             const matcher = new Minimatch(inputs.pattern);
-            artifacts = artifacts.filter(artifact => matcher.match(artifact.name));
+            // A pattern may match either the artifact name or, for files uploaded by
+            // upload-artifact with a manifest, the original relative path
+            artifacts = artifacts.filter(artifact => {
+                const original = manifestPaths.get(artifact.name);
+                return (matcher.match(artifact.name) ||
+                    (original !== undefined && matcher.match(original)));
+            });
             core_debug(`Filtered from ${listArtifactResponse.artifacts.length} to ${artifacts.length} artifacts`);
         }
         else {
@@ -129603,6 +129670,24 @@ async function run() {
             }
         }
     }
+    // An upload-artifact manifest (archive: false with multiple files) lets us
+    // restore the original directory structure of the files it describes
+    artifacts = artifacts.filter(a => !isManifestName(a.name));
+    const restorePaths = new Map();
+    for (const a of artifacts) {
+        const original = manifestPaths.get(a.name);
+        if (original !== undefined) {
+            restorePaths.set(a.name, original);
+        }
+    }
+    // Fail before downloading anything if a manifest path is unsafe
+    restorePaths.forEach(original => resolveRestorePath(resolvedPath, original));
+    if (restorePaths.size) {
+        info(`Restoring original paths for ${restorePaths.size} artifact(s) using upload manifest(s)`);
+    }
+    const stagingDir = restorePaths.size
+        ? await promises_namespaceObject.mkdtemp(external_path_.join(process.env['RUNNER_TEMP'] || external_os_.tmpdir(), 'download-staging-'))
+        : '';
     if (artifacts.length) {
         info(`Preparing to download the following artifacts:`);
         artifacts.forEach(artifact => {
@@ -129613,11 +129698,13 @@ async function run() {
         name: artifact.name,
         promise: lib_artifact.downloadArtifact(artifact.id, {
             ...options,
-            path: isSingleArtifactDownload ||
-                inputs.mergeMultiple ||
-                artifacts.length === 1
-                ? resolvedPath
-                : external_path_.join(resolvedPath, artifact.name),
+            path: restorePaths.has(artifact.name)
+                ? external_path_.join(stagingDir, String(artifact.id))
+                : isSingleArtifactDownload ||
+                    inputs.mergeMultiple ||
+                    artifacts.length === 1
+                    ? resolvedPath
+                    : external_path_.join(resolvedPath, artifact.name),
             expectedHash: artifact.digest,
             skipDecompress: inputs.skipDecompress
         })
@@ -129655,6 +129742,26 @@ async function run() {
         inputs.digestMismatch === DigestMismatchBehavior.Error) {
         throw new Error(`Digest validation failed for artifact(s): ${digestMismatches.join(', ')}. ` +
             `Use 'digest-mismatch: warn' to continue on mismatch.`);
+    }
+    if (stagingDir) {
+        try {
+            for (const artifact of artifacts) {
+                const relative = restorePaths.get(artifact.name);
+                if (relative === undefined)
+                    continue;
+                const dest = resolveRestorePath(resolvedPath, relative);
+                const source = external_path_.join(stagingDir, String(artifact.id));
+                const files = await promises_namespaceObject.readdir(source);
+                if (files.length !== 1) {
+                    throw new Error(`Expected one file in artifact '${artifact.name}' but found ${files.length}`);
+                }
+                await promises_namespaceObject.mkdir(external_path_.dirname(dest), { recursive: true });
+                await promises_namespaceObject.copyFile(external_path_.join(source, files[0]), dest);
+            }
+        }
+        finally {
+            await promises_namespaceObject.rm(stagingDir, { recursive: true, force: true });
+        }
     }
     info(`Total of ${artifacts.length} artifact(s) downloaded`);
     setOutput(Outputs.DownloadPath, resolvedPath);

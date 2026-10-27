@@ -12,12 +12,13 @@ inputs:
     description: 'Destination path. Supports basic tilde expansion. Defaults to $GITHUB_WORKSPACE'
     required: false
   pattern:
-    description: 'A glob pattern matching the artifacts that should be downloaded. Ignored if name is specified.'
+    description: 'A glob pattern matching the artifacts that should be downloaded. For files uploaded individually by upload-artifact (archive: false), it may also match the original relative path. Ignored if name is specified.'
     required: false
   merge-multiple:
     description: 'When multiple artifacts are matched, this changes the behavior of the destination directories.
       If true, the downloaded artifacts will be in the same directory specified by path.
-      If false, the downloaded artifacts will be extracted into individual named directories within the specified path.'
+      If false, the downloaded artifacts will be extracted into individual named directories within the specified path.
+      Artifacts uploaded with `archive: false` from multiple files are an exception: if a `.artifact_upload_manifest.<name>.json` artifact exists in the run, those files are restored to their original relative paths under path.'
     required: false
     default: 'false'
   github-token:

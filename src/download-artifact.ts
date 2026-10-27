@@ -1,3 +1,4 @@
+import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
 import * as core from '@actions/core'
@@ -7,6 +8,86 @@ import {Minimatch} from 'minimatch'
 import {Inputs, Outputs, DigestMismatchBehavior} from './constants.js'
 
 const PARALLEL_DOWNLOADS = 5
+const MANIFEST_PREFIX = '.artifact_upload_manifest.'
+const MANIFEST_SUFFIX = '.json'
+
+const isManifestName = (name: string): boolean =>
+  name.startsWith(MANIFEST_PREFIX) &&
+  name.endsWith(MANIFEST_SUFFIX) &&
+  name.length > MANIFEST_PREFIX.length + MANIFEST_SUFFIX.length
+
+// Maps artifact name -> original relative path, as written by upload-artifact
+async function readManifest(
+  manifestArtifact: Artifact,
+  options: FindOptions
+): Promise<Map<string, string>> {
+  const dir = await fs.mkdtemp(
+    path.join(process.env['RUNNER_TEMP'] || os.tmpdir(), 'download-manifest-')
+  )
+  try {
+    await artifactClient.downloadArtifact(manifestArtifact.id, {
+      ...options,
+      path: dir,
+      expectedHash: manifestArtifact.digest
+    })
+    let manifest
+    try {
+      manifest = JSON.parse(
+        await fs.readFile(path.join(dir, manifestArtifact.name), 'utf8')
+      )
+    } catch (error) {
+      throw new Error(
+        `Unable to read manifest '${manifestArtifact.name}': ${(error as Error).message}`
+      )
+    }
+    if (manifest?.version !== 1 || !Array.isArray(manifest.files)) {
+      throw new Error(
+        `Manifest '${manifestArtifact.name}' has an unsupported format`
+      )
+    }
+    const map = new Map<string, string>()
+    for (const entry of manifest.files) {
+      if (
+        typeof entry?.artifact !== 'string' ||
+        typeof entry?.path !== 'string' ||
+        !entry.path
+      ) {
+        throw new Error(
+          `Manifest '${manifestArtifact.name}' contains an invalid entry`
+        )
+      }
+      map.set(entry.artifact, entry.path)
+    }
+    return map
+  } finally {
+    await fs.rm(dir, {recursive: true, force: true})
+  }
+}
+
+// Combines the manifests of every upload-artifact group found in the run
+async function readAllManifests(
+  allArtifacts: Artifact[],
+  options: FindOptions
+): Promise<Map<string, string>> {
+  const restorePaths = new Map<string, string>()
+  for (const manifestArtifact of allArtifacts.filter(a =>
+    isManifestName(a.name)
+  )) {
+    const entries = await readManifest(manifestArtifact, options)
+    entries.forEach((p, name) => restorePaths.set(name, p))
+  }
+  return restorePaths
+}
+
+// Resolves a manifest path, refusing anything that would escape the destination
+function resolveRestorePath(root: string, relative: string): string {
+  const dest = path.resolve(root, ...relative.split('/'))
+  const fromRoot = path.relative(root, dest)
+  if (!fromRoot || fromRoot.startsWith('..') || path.isAbsolute(fromRoot)) {
+    throw new Error(`Manifest path '${relative}' escapes the download path`)
+  }
+  return dest
+}
 
 export const chunk = <T>(arr: T[], n: number): T[][] =>
   arr.reduce((acc, cur, i) => {
@@ -81,6 +162,7 @@ export async function run(): Promise<void> {
 
   let artifacts: Artifact[] = []
   let artifactIds: number[] = []
+  let manifestPaths = new Map<string, string>()
 
   if (isSingleArtifactDownload) {
     core.info(`Downloading single artifact`)
@@ -128,6 +210,10 @@ export async function run(): Promise<void> {
       ...options
     })
 
+    manifestPaths = await readAllManifests(
+      listArtifactResponse.artifacts,
+      options
+    )
     artifacts = listArtifactResponse.artifacts.filter(artifact =>
       artifactIds.includes(artifact.id)
     )
@@ -150,6 +236,10 @@ export async function run(): Promise<void> {
       latest: true,
       ...options
     })
+    manifestPaths = await readAllManifests(
+      listArtifactResponse.artifacts,
+      options
+    )
     artifacts = listArtifactResponse.artifacts
 
     core.debug(`Found ${artifacts.length} artifacts in run`)
@@ -157,7 +247,15 @@ export async function run(): Promise<void> {
     if (inputs.pattern) {
       core.info(`Filtering artifacts by pattern '${inputs.pattern}'`)
       const matcher = new Minimatch(inputs.pattern)
-      artifacts = artifacts.filter(artifact => matcher.match(artifact.name))
+      // A pattern may match either the artifact name or, for files uploaded by
+      // upload-artifact with a manifest, the original relative path
+      artifacts = artifacts.filter(artifact => {
+        const original = manifestPaths.get(artifact.name)
+        return (
+          matcher.match(artifact.name) ||
+          (original !== undefined && matcher.match(original))
+        )
+      })
       core.debug(
         `Filtered from ${listArtifactResponse.artifacts.length} to ${artifacts.length} artifacts`
       )
@@ -173,6 +271,32 @@ export async function run(): Promise<void> {
     }
   }
 
+  // An upload-artifact manifest (archive: false with multiple files) lets us
+  // restore the original directory structure of the files it describes
+  artifacts = artifacts.filter(a => !isManifestName(a.name))
+  const restorePaths = new Map<string, string>()
+  for (const a of artifacts) {
+    const original = manifestPaths.get(a.name)
+    if (original !== undefined) {
+      restorePaths.set(a.name, original)
+    }
+  }
+  // Fail before downloading anything if a manifest path is unsafe
+  restorePaths.forEach(original => resolveRestorePath(resolvedPath, original))
+  if (restorePaths.size) {
+    core.info(
+      `Restoring original paths for ${restorePaths.size} artifact(s) using upload manifest(s)`
+    )
+  }
+  const stagingDir = restorePaths.size
+    ? await fs.mkdtemp(
+        path.join(
+          process.env['RUNNER_TEMP'] || os.tmpdir(),
+          'download-staging-'
+        )
+      )
+    : ''
+
   if (artifacts.length) {
     core.info(`Preparing to download the following artifacts:`)
     artifacts.forEach(artifact => {
@@ -186,10 +310,11 @@ export async function run(): Promise<void> {
     name: artifact.name,
     promise: artifactClient.downloadArtifact(artifact.id, {
       ...options,
-      path:
-        isSingleArtifactDownload ||
-        inputs.mergeMultiple ||
-        artifacts.length === 1
+      path: restorePaths.has(artifact.name)
+        ? path.join(stagingDir, String(artifact.id))
+        : isSingleArtifactDownload ||
+            inputs.mergeMultiple ||
+            artifacts.length === 1
           ? resolvedPath
           : path.join(resolvedPath, artifact.name),
       expectedHash: artifact.digest,
@@ -239,6 +364,27 @@ export async function run(): Promise<void> {
       `Digest validation failed for artifact(s): ${digestMismatches.join(', ')}. ` +
         `Use 'digest-mismatch: warn' to continue on mismatch.`
     )
+  }
+
+  if (stagingDir) {
+    try {
+      for (const artifact of artifacts) {
+        const relative = restorePaths.get(artifact.name)
+        if (relative === undefined) continue
+        const dest = resolveRestorePath(resolvedPath, relative)
+        const source = path.join(stagingDir, String(artifact.id))
+        const files = await fs.readdir(source)
+        if (files.length !== 1) {
+          throw new Error(
+            `Expected one file in artifact '${artifact.name}' but found ${files.length}`
+          )
+        }
+        await fs.mkdir(path.dirname(dest), {recursive: true})
+        await fs.copyFile(path.join(source, files[0]), dest)
+      }
+    } finally {
+      await fs.rm(stagingDir, {recursive: true, force: true})
+    }
   }
 
   core.info(`Total of ${artifacts.length} artifact(s) downloaded`)
