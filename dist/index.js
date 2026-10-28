@@ -129750,7 +129750,11 @@ async function run() {
                         ? resolvedPath
                         : external_path_.join(resolvedPath, artifact.name),
                 expectedHash: artifact.digest,
-                skipDecompress: inputs.skipDecompress
+                // Restored files must stay as uploaded: the client would otherwise extract
+                // a .zip artifact instead of leaving the single file the manifest describes.
+                skipDecompress: restorePaths.has(artifact.name)
+                    ? true
+                    : inputs.skipDecompress
             })
         }));
         const chunkedPromises = chunk(downloadPromises, PARALLEL_DOWNLOADS);

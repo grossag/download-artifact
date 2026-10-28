@@ -238,6 +238,14 @@ describe('download', () => {
       expect(core.info).toHaveBeenCalledWith(
         'Total of 2 artifact(s) downloaded'
       )
+      // The client would extract zip artifacts unless told not to
+      const restoredCalls = (
+        artifact.default.downloadArtifact as jest.Mock<any>
+      ).mock.calls.filter(([id]) => id !== 1)
+      expect(restoredCalls).toHaveLength(2)
+      for (const [, opts] of restoredCalls) {
+        expect((opts as any).skipDecompress).toBe(true)
+      }
     })
 
     test('combines manifests from several upload groups', async () => {
